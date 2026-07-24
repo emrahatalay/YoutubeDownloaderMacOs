@@ -92,6 +92,7 @@ nonisolated enum YTDLPService {
         quality: AudioQuality,
         outputDirectory: URL,
         tools: ResolvedTools,
+        videoHeight: Int? = nil,
         embedMetadata: Bool = true,
         embedThumbnail: Bool = false,
         progress: @escaping @Sendable (Double) -> Void
@@ -105,6 +106,7 @@ nonisolated enum YTDLPService {
             quality: quality,
             outputDirectory: outputDirectory,
             ffmpegPath: tools.ffmpeg,
+            videoHeight: videoHeight,
             embedMetadata: embedMetadata,
             embedThumbnail: embedThumbnail
         )
@@ -181,6 +183,91 @@ nonisolated enum YTDLPService {
         }
     }
 
+    // MARK: - Kalite Sorgulama
+
+    /// Videonun sunduğu çözünürlükleri (yükseklik, örn. 1080) büyükten küçüğe döndürür.
+    /// `yt-dlp -j` çıktısındaki `formats` dizisinden video içeren formatların
+    /// yükseklikleri toplanır.
+    static func fetchVideoQualities(
+        url: String,
+        tools: ResolvedTools
+    ) async throws -> [Int] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tools.ytdlp)
+        process.arguments = ["-j", "--no-playlist", url]
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (environment["PATH"] ?? "")
+        process.environment = environment
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        let buffer = DataBuffer()
+        let errorCollector = OutputCollector()
+
+        // JSON çıktısı 64KB'lık pipe tamponundan büyük olabileceği için sürekli okunmalı.
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            buffer.append(data)
+        }
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            errorCollector.appendError(text)
+        }
+
+        let jsonData: Data = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                process.terminationHandler = { finishedProcess in
+                    outputPipe.fileHandleForReading.readabilityHandler = nil
+                    errorPipe.fileHandleForReading.readabilityHandler = nil
+                    // Süreç kapanırken tamponda kalan son veriyi de al.
+                    buffer.append(outputPipe.fileHandleForReading.readDataToEndOfFile())
+
+                    if errorCollector.isCancelled {
+                        continuation.resume(throwing: DownloadError.cancelled)
+                    } else if finishedProcess.terminationStatus == 0 {
+                        continuation.resume(returning: buffer.data)
+                    } else {
+                        continuation.resume(throwing: DownloadError.processFailed(
+                            code: finishedProcess.terminationStatus,
+                            message: errorCollector.errorText
+                        ))
+                    }
+                }
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        } onCancel: {
+            errorCollector.markCancelled()
+            process.terminate()
+        }
+
+        return parseHeights(from: jsonData)
+    }
+
+    /// `-j` JSON çıktısından benzersiz video yüksekliklerini ayıklar.
+    private static func parseHeights(from data: Data) -> [Int] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let formats = json["formats"] as? [[String: Any]] else {
+            return []
+        }
+        var heights = Set<Int>()
+        for format in formats {
+            let vcodec = format["vcodec"] as? String ?? "none"
+            guard vcodec != "none", let height = format["height"] as? Int, height > 0 else { continue }
+            heights.insert(height)
+        }
+        return heights.sorted(by: >)
+    }
+
     // MARK: - Argüman İnşası
 
     /// Seçilen formata göre yt-dlp argümanlarını üretir.
@@ -190,6 +277,7 @@ nonisolated enum YTDLPService {
         quality: AudioQuality,
         outputDirectory: URL,
         ffmpegPath: String,
+        videoHeight: Int?,
         embedMetadata: Bool,
         embedThumbnail: Bool
     ) -> [String] {
@@ -201,8 +289,11 @@ nonisolated enum YTDLPService {
 
         switch format {
         case .mp4:
+            // Kullanıcı belirli bir çözünürlük seçtiyse yükseklik filtresi uygulanır;
+            // seçmediyse mevcut en iyi kalite indirilir.
+            let heightFilter = videoHeight.map { "[height<=\($0)]" } ?? ""
             arguments = [
-                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "-f", "bestvideo\(heightFilter)[ext=mp4]+bestaudio[ext=m4a]/best\(heightFilter)[ext=mp4]/best\(heightFilter)",
                 "--merge-output-format", "mp4"
             ]
         case .mp3:
@@ -252,6 +343,25 @@ nonisolated enum YTDLPService {
             return nil
         }
         return value
+    }
+}
+
+// MARK: - Veri Tamponu
+
+/// Arka plan kuyruğundan beslenen, kilitle korunan basit veri tamponu.
+private nonisolated final class DataBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _data = Data()
+
+    var data: Data {
+        lock.lock(); defer { lock.unlock() }
+        return _data
+    }
+
+    func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        _data.append(chunk)
     }
 }
 

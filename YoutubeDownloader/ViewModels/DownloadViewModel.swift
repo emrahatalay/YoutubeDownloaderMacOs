@@ -17,9 +17,37 @@ final class DownloadViewModel {
 
     // MARK: - Kullanıcı Girdileri
 
-    var urlString: String = ""
-    var format: DownloadFormat = .mp4
+    var urlString: String = "" {
+        didSet {
+            guard urlString != oldValue else { return }
+            handleURLChange()
+        }
+    }
+    var format: DownloadFormat = .mp4 {
+        didSet {
+            guard format != oldValue else { return }
+            // MP4'e geçildiyse ve kaliteler henüz alınmadıysa sorgula.
+            if format == .mp4, case .idle = videoQualityState {
+                scheduleQualityFetch(debounce: false)
+            }
+        }
+    }
     var audioQuality: AudioQuality = .high
+
+    // MARK: - Video Kalitesi
+
+    /// Girilen bağlantı için mevcut video çözünürlüklerinin sorgu durumu.
+    enum VideoQualityState: Equatable {
+        case idle
+        case fetching
+        case loaded([Int])
+        case failed
+    }
+
+    private(set) var videoQualityState: VideoQualityState = .idle
+
+    /// Seçilen çözünürlük (yükseklik). `nil` = mevcut en iyi kalite.
+    var selectedVideoHeight: Int?
 
     // MARK: - Durum
 
@@ -73,6 +101,7 @@ final class DownloadViewModel {
     // MARK: - Özel Alanlar
 
     private var currentTask: Task<Void, Never>?
+    private var qualityFetchTask: Task<Void, Never>?
     /// Bulunan araç yolları; ayarlar ekranında da gösterilir.
     private(set) var resolvedTools: YTDLPService.ResolvedTools?
     private let historyLimit = 10
@@ -125,12 +154,53 @@ final class DownloadViewModel {
             case .success(let tools):
                 self.resolvedTools = tools
                 self.toolStatus = .ready
+                // Araçlar hazır olduğunda geçerli bir bağlantı varsa kaliteleri sorgula.
+                self.scheduleQualityFetch(debounce: false)
             case .failure(.toolsNotInstalled(let missing)):
                 self.resolvedTools = nil
                 self.toolStatus = .missing(missing)
             case .failure:
                 self.resolvedTools = nil
                 self.toolStatus = .missing(["yt-dlp", "ffmpeg"])
+            }
+        }
+    }
+
+    // MARK: - Video Kalitesi Sorgulama
+
+    /// Bağlantı değiştiğinde kalite listesi geçersiz kalır; yeniden sorgulanır.
+    private func handleURLChange() {
+        qualityFetchTask?.cancel()
+        videoQualityState = .idle
+        selectedVideoHeight = nil
+        scheduleQualityFetch(debounce: true)
+    }
+
+    /// Geçerli bir bağlantı varsa mevcut çözünürlükleri arka planda sorgular.
+    /// - Parameter debounce: Yazma sırasında art arda sorgu atılmaması için kısa bekleme.
+    func scheduleQualityFetch(debounce: Bool) {
+        qualityFetchTask?.cancel()
+
+        let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard format == .mp4,
+              let tools = resolvedTools,
+              isValidYouTubeURL(trimmedURL) else {
+            return
+        }
+
+        videoQualityState = .fetching
+        qualityFetchTask = Task {
+            if debounce {
+                try? await Task.sleep(for: .milliseconds(600))
+                guard !Task.isCancelled else { return }
+            }
+            do {
+                let heights = try await YTDLPService.fetchVideoQualities(url: trimmedURL, tools: tools)
+                guard !Task.isCancelled else { return }
+                self.videoQualityState = heights.isEmpty ? .failed : .loaded(heights)
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.videoQualityState = .failed
             }
         }
     }
@@ -153,6 +223,7 @@ final class DownloadViewModel {
 
         let selectedFormat = format
         let selectedQuality = audioQuality
+        let selectedHeight = (format == .mp4) ? selectedVideoHeight : nil
         let directory = downloadDirectory
 
         currentTask = Task {
@@ -163,6 +234,7 @@ final class DownloadViewModel {
                     quality: selectedQuality,
                     outputDirectory: directory,
                     tools: tools,
+                    videoHeight: selectedHeight,
                     embedMetadata: embedMetadata,
                     embedThumbnail: embedThumbnail
                 ) { percent in

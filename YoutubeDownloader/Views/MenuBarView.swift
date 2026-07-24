@@ -144,8 +144,10 @@ struct MenuBarView: View {
                 .disabled(viewModel.isDownloading)
             }
 
-            // Ses kalitesi (yalnızca ses formatlarında)
-            if viewModel.format.isAudioOnly {
+            // Kalite: MP4'te videonun sunduğu çözünürlükler, ses formatlarında bit hızı.
+            if viewModel.format == .mp4 {
+                videoQualitySection
+            } else {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Ses Kalitesi")
                         .font(.caption)
@@ -164,7 +166,58 @@ struct MenuBarView: View {
             // Aksiyon + durum
             actionArea
         }
-        .animation(.snappy(duration: 0.2), value: viewModel.format.isAudioOnly)
+        .animation(.snappy(duration: 0.2), value: viewModel.format)
+        .animation(.snappy(duration: 0.2), value: viewModel.videoQualityState)
+    }
+
+    /// MP4 için videonun sunduğu çözünürlüklerin listelendiği bölüm.
+    @ViewBuilder
+    private var videoQualitySection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Video Kalitesi")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            switch viewModel.videoQualityState {
+            case .idle:
+                Text("Kaliteler, bağlantı girildiğinde listelenir.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+
+            case .fetching:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Mevcut kaliteler alınıyor…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+            case .loaded(let heights):
+                Picker("Video Kalitesi", selection: $viewModel.selectedVideoHeight) {
+                    Text("En İyi (\(heights.first.map { "\($0)p" } ?? "otomatik"))")
+                        .tag(Optional<Int>.none)
+                    ForEach(heights, id: \.self) { height in
+                        Text("\(height)p").tag(Optional(height))
+                    }
+                }
+                .labelsHidden()
+                .disabled(viewModel.isDownloading)
+
+            case .failed:
+                HStack(spacing: 6) {
+                    Text("Kaliteler alınamadı; en iyi kalite kullanılacak.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Button {
+                        viewModel.scheduleQualityFetch(debounce: false)
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Tekrar dene")
+                }
+            }
+        }
     }
 
     @ViewBuilder
