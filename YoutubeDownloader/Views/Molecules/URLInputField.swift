@@ -19,10 +19,24 @@ struct URLInputField: View {
             Image(systemName: "link")
                 .foregroundStyle(.tertiary)
                 .font(.caption)
-            TextField("https://youtube.com/watch?v=…", text: $text)
-                .textFieldStyle(.plain)
-                .disabled(isDisabled)
-                .onSubmit(onSubmit)
+
+            // `Text("…")` bir string literalini `LocalizedStringKey` olarak yorumlar
+            // ve Markdown otomatik-bağlantı tespiti yapar; URL desenine uyan metni
+            // kendi `foregroundStyle`'ımızdan önce gelen bağlantı (mavi) rengiyle
+            // boyar. `Text(verbatim:)` kullanarak bu yorumlamayı devre dışı
+            // bırakıyoruz ki placeholder her zaman temaya uygun kalsın.
+            ZStack(alignment: .leading) {
+                if text.isEmpty {
+                    Text(verbatim: "https://youtube.com/watch?v=…")
+                        .foregroundStyle(.placeholder)
+                        .allowsHitTesting(false)
+                }
+                TextField("", text: $text)
+                    .textFieldStyle(.plain)
+                    .accessibilityLabel("YouTube Bağlantısı")
+                    .disabled(isDisabled)
+                    .onSubmit(onSubmit)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
